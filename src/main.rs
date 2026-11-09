@@ -5,6 +5,7 @@ mod screens;
 mod settings;
 mod theme;
 mod tools;
+mod update;
 mod views;
 
 use guc::academic::{self, CourseAttendance, CourseGrades, Evaluation};
@@ -28,6 +29,7 @@ fn initial_size() -> Size {
 }
 
 fn main() -> iced::Result {
+    update::clean_up();
     iced::application("GUC Station", App::update, App::view)
         .theme(App::theme)
         .font(include_bytes!("../assets/fonts/IBMPlexSans-Regular.ttf").as_slice())
@@ -337,7 +339,17 @@ pub enum Session {
     SignedIn(Box<Workspace>),
 }
 
+/// The update pop-up, shown over whatever screen is open.
+pub enum UpdateDialog {
+    Checking,
+    UpToDate,
+    Available(update::Release),
+    Installing(update::Release),
+    Failed { title: &'static str, message: String },
+}
+
 pub struct App {
+    pub update: Option<UpdateDialog>,
     /// A problem creating the chosen downloads folder, shown where it was chosen.
     pub folder_error: Option<String>,
     /// The folder dialog is open, so its buttons wait.
@@ -418,6 +430,11 @@ pub enum Message {
     DiagnosticsSaved(Result<(usize, PathBuf), String>),
 
     ThemePicked(theme::AppTheme),
+    CheckForUpdates,
+    UpdateChecked(Result<Option<update::Release>, String>),
+    InstallUpdate,
+    UpdateInstalled(Result<PathBuf, String>),
+    CloseUpdateDialog,
     /// Keeps the suggested downloads folder on first start.
     UseDownloadFolder(PathBuf),
     ChooseDownloadFolder,
@@ -434,10 +451,10 @@ impl App {
         match creds::load() {
             Some((login, password)) => {
                 let form = LoginForm { login: login.clone(), password: password.clone(), remember: true, busy: true, error: None };
-                (App { settings, session: Session::SignedOut(form), size: initial_size(), folder_error: None, picking_folder: false }, sign_in(login, password))
+                (App { settings, session: Session::SignedOut(form), size: initial_size(), folder_error: None, picking_folder: false, update: None }, sign_in(login, password))
             }
             None => (
-                App { settings, session: Session::SignedOut(LoginForm { remember: true, ..Default::default() }), size: initial_size(), folder_error: None, picking_folder: false },
+                App { settings, session: Session::SignedOut(LoginForm { remember: true, ..Default::default() }), size: initial_size(), folder_error: None, picking_folder: false, update: None },
                 Task::none(),
             ),
         }
@@ -452,7 +469,7 @@ impl App {
         let busy = match &self.session {
             Session::SignedOut(form) => form.busy,
             Session::SignedIn(ws) => ws.is_busy(),
-        };
+        } || matches!(self.update, Some(UpdateDialog::Checking | UpdateDialog::Installing(_)));
         let resized = window::resize_events().map(|(_, size)| Message::Resized(size));
         if busy {
             let tick = iced::time::every(std::time::Duration::from_millis(views::LOADER_FRAME_MS)).map(|_| Message::Tick);
@@ -482,6 +499,50 @@ impl App {
             Message::ThemePicked(choice) => {
                 self.settings.theme = choice;
                 self.settings.save();
+                return Task::none();
+            }
+            Message::CheckForUpdates => {
+                if !matches!(self.update, Some(UpdateDialog::Checking | UpdateDialog::Installing(_))) {
+                    self.update = Some(UpdateDialog::Checking);
+                    return Task::perform(update::check(), Message::UpdateChecked);
+                }
+                return Task::none();
+            }
+            Message::UpdateChecked(r) => {
+                // Closed while checking: the answer isn't wanted any more.
+                if matches!(self.update, Some(UpdateDialog::Checking)) {
+                    self.update = Some(match r {
+                        Ok(Some(release)) => UpdateDialog::Available(release),
+                        Ok(None) => UpdateDialog::UpToDate,
+                        Err(message) => UpdateDialog::Failed { title: "Couldn't check for updates", message },
+                    });
+                }
+                return Task::none();
+            }
+            Message::InstallUpdate => {
+                if let Some(UpdateDialog::Available(release)) = self.update.take() {
+                    self.update = Some(UpdateDialog::Installing(release.clone()));
+                    return Task::perform(update::update(release), Message::UpdateInstalled);
+                }
+                return Task::none();
+            }
+            Message::UpdateInstalled(r) => {
+                let started = r.and_then(|exe| {
+                    std::process::Command::new(&exe)
+                        .spawn()
+                        .map_err(|e| format!("The update is installed, but the app couldn't restart itself ({e}). Close it and open it again."))
+                });
+                match started {
+                    Ok(_) => return iced::exit(),
+                    Err(message) => self.update = Some(UpdateDialog::Failed { title: "Couldn't update", message }),
+                }
+                return Task::none();
+            }
+            Message::CloseUpdateDialog => {
+                // An update in progress finishes first; closing mid-swap would leave things half done.
+                if !matches!(self.update, Some(UpdateDialog::Installing(_))) {
+                    self.update = None;
+                }
                 return Task::none();
             }
             Message::UseDownloadFolder(dir) => {

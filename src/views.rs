@@ -3,12 +3,13 @@
 use crate::screens;
 use crate::theme::{self, AppTheme, tokens};
 use crate::tools::{CalcMsg, GpaMsg};
-use crate::{App, COMPOSE_TO, Draft, LoginForm, Load, MAIL_PAGE_SIZE, Message, Notice, Screen, Session, Workspace};
+use crate::update;
+use crate::{App, COMPOSE_TO, Draft, UpdateDialog, LoginForm, Load, MAIL_PAGE_SIZE, Message, Notice, Screen, Session, Workspace};
 use guc::mail::{Compose, Folder};
 use guc::page::{Page, Table};
 use guc::portal::{self, Section};
 use iced::widget::{
-    Column, Row, Space, button, center, image, checkbox, column, container, horizontal_rule, horizontal_space, pick_list, text_editor,
+    Column, Row, Space, button, center, image, mouse_area, opaque, stack, checkbox, column, container, horizontal_rule, horizontal_space, pick_list, text_editor,
     row, scrollable, text, text_input,
 };
 use iced::{Alignment, Element, Length, Theme};
@@ -68,7 +69,11 @@ pub fn root(app: &App) -> El<'_> {
         Session::SignedIn(_) if app.settings.download_dir.is_none() => download_setup(app),
         Session::SignedIn(ws) => shell(app, ws),
     };
-    container(body).width(Length::Fill).height(Length::Fill).style(theme::app_bg).into()
+    let page = container(body).width(Length::Fill).height(Length::Fill).style(theme::app_bg);
+    match &app.update {
+        Some(dialog) => stack![page, update_dialog(dialog)].into(),
+        None => page.into(),
+    }
 }
 
 // ---------------------------------------------------------------- sign in
@@ -158,6 +163,66 @@ fn download_setup(app: &App) -> El<'_> {
         card = card.push(banner(e.clone(), true, None));
     }
     center(card).padding(24).into()
+}
+
+/// The update pop-up over a dimmed page. Clicking outside it closes it.
+fn update_dialog(dialog: &UpdateDialog) -> El<'_> {
+    let actions = |buttons: Vec<El<'static>>| -> El<'static> { Row::with_children(buttons).spacing(8).align_y(Alignment::Center).into() };
+    let primary = |label: &'static str, msg: Message| -> El<'static> {
+        button(text(label).size(14).font(theme::MEDIUM)).padding([8, 18]).style(theme::primary_button).on_press(msg).into()
+    };
+    let content: Column<'_, Message> = match dialog {
+        UpdateDialog::Checking => column![text("Checking for updates…").size(20).font(theme::SEMIBOLD), loader("Asking GitHub for the newest version")],
+        UpdateDialog::UpToDate => column![
+            text("You're up to date").size(20).font(theme::SEMIBOLD),
+            muted(format!("GUC Station {} is the newest version.", update::CURRENT)).size(14),
+            actions(vec![horizontal_space().into(), primary("OK", Message::CloseUpdateDialog)]),
+        ],
+        UpdateDialog::Available(r) => {
+            let mut c = column![
+                text(format!("Update to version {}?", r.version)).size(20).font(theme::SEMIBOLD),
+                muted(format!(
+                    "You have version {}.{}",
+                    update::CURRENT,
+                    if r.prerelease { " This one is an early release, so it may have rough edges." } else { "" }
+                ))
+                .size(14),
+            ];
+            if !r.notes.is_empty() {
+                c = c.push(
+                    container(scrollable(text(r.notes.as_str()).size(13)).height(Length::Shrink))
+                        .max_height(180)
+                        .padding([10, 12])
+                        .width(Length::Fill)
+                        .style(theme::panel),
+                );
+            }
+            c.push(muted(format!("The app downloads the update from GitHub ({}), checks it, then restarts.", file_size(r.asset_size))).size(12))
+                .push(actions(vec![
+                    link("Release page", Message::OpenInBrowser(r.page.clone())),
+                    horizontal_space().into(),
+                    ghost("Not now", Message::CloseUpdateDialog),
+                    primary("Update now", Message::InstallUpdate),
+                ]))
+        }
+        UpdateDialog::Installing(r) => column![
+            text(format!("Updating to version {}…", r.version)).size(20).font(theme::SEMIBOLD),
+            loader("Downloading and checking the update"),
+            muted("GUC Station restarts on its own when it's done.").size(13),
+        ],
+        UpdateDialog::Failed { title, message } => column![
+            text(*title).size(20).font(theme::SEMIBOLD),
+            text(message.as_str()).size(14),
+            actions(vec![
+                link("Open the releases page", Message::OpenInBrowser(crate::update::RELEASES_PAGE.into())),
+                horizontal_space().into(),
+                primary("Close", Message::CloseUpdateDialog),
+            ]),
+        ],
+    };
+    let card = container(content.spacing(14).width(Length::Fill)).padding(24).max_width(460).style(theme::dialog);
+    // The card swallows its own clicks so only clicks outside it close it.
+    opaque(mouse_area(center(opaque(card)).style(theme::scrim)).on_press(Message::CloseUpdateDialog))
 }
 
 // ---------------------------------------------------------------- shell
@@ -1101,7 +1166,13 @@ fn settings<'a>(app: &'a App, ws: &'a Workspace) -> El<'a> {
     }
     let privacy = column![
             subheading("Privacy"),
-            muted("GUC Station talks only to apps.guc.edu.eg, cms.guc.edu.eg and mail.guc.edu.eg. Your grades, mail and password never pass through any other server.").size(14),
+            muted("GUC Station talks only to apps.guc.edu.eg, cms.guc.edu.eg and mail.guc.edu.eg. Your grades, mail and password never pass through any other server. Checking for updates contacts GitHub, and only when you press the button.").size(14),
+        ].spacing(10);
+    let updates = column![
+            subheading("Updates"),
+            text(format!("Version {}", update::CURRENT)).size(14),
+            muted("New versions are published on GitHub. Updating downloads the new version, checks it, and restarts the app.").size(13),
+            row![secondary("Check for updates", Message::CheckForUpdates)],
         ].spacing(10);
     let troubleshooting = column![
             subheading("Troubleshooting"),
@@ -1115,7 +1186,7 @@ fn settings<'a>(app: &'a App, ws: &'a Workspace) -> El<'a> {
     column![
         page_header("Settings".into(), None, vec![]),
         panel(column![subheading("Theme"), picker].spacing(12)),
-        card_grid(vec![account.into(), downloads.into(), privacy.into(), troubleshooting.into()], ws.columns(340.0)),
+        card_grid(vec![account.into(), downloads.into(), updates.into(), privacy.into(), troubleshooting.into()], ws.columns(340.0)),
     ]
     .spacing(COLUMN_GAP)
     .into()

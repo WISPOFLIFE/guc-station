@@ -1,4 +1,4 @@
-GUC Station 0.1.0
+GUC Station 0.2.0
 A desktop app for the GUC student portal, CMS and university mail.
 This is an unofficial app, not made or endorsed by the German University in Cairo.
 
@@ -16,6 +16,7 @@ someone you trust.
 
 YOUR DATA
 - The app only talks to apps.guc.edu.eg, cms.guc.edu.eg and mail.guc.edu.eg.
+  "Check for updates" in Settings also contacts GitHub, only when you press it.
 - If you tick "Keep me signed in", your password is saved in Windows Credential
   Manager on this PC. Signing out in Settings removes it.
 - Settings and any pages you save for troubleshooting are in

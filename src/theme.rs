@@ -302,6 +302,22 @@ pub fn editor(theme: &Theme, status: text_editor::Status) -> text_editor::Style 
     }
 }
 
+/// The dimmed backdrop behind a pop-up.
+pub fn scrim(_theme: &Theme) -> container::Style {
+    container::Style { background: Some(Color { a: 0.55, ..Color::BLACK }.into()), ..Default::default() }
+}
+
+/// A pop-up card, lifted off the page.
+pub fn dialog(theme: &Theme) -> container::Style {
+    let t = tokens(theme);
+    container::Style {
+        background: Some(t.surface.into()),
+        border: Border { color: t.border, width: 1.0, radius: 12.0.into() },
+        shadow: Shadow { color: Color { a: 0.35, ..Color::BLACK }, offset: iced::Vector::new(0.0, 8.0), blur_radius: 28.0 },
+        text_color: Some(t.text),
+    }
+}
+
 pub fn select(theme: &Theme, status: pick_list::Status) -> pick_list::Style {
     let t = tokens(theme);
     pick_list::Style {

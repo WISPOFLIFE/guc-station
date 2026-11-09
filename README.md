@@ -1,7 +1,7 @@
 # GUC Station
 
 A native Windows app for GUC students, written in Rust with [Iced](https://iced.rs). It signs in to the
-student portal, CMS and university mail with one GUC account and talks only to `*.guc.edu.eg`.
+student portal, CMS and university mail with one GUC account and talks only to `*.guc.edu.eg`, plus GitHub when you check for updates.
 
 ## Run
 
