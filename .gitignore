@@ -1,0 +1,7 @@
+/target
+# Raw portal pages saved by the probe tool; they contain personal data.
+/fixtures
+.vscode/*
+.idea
+.DS_Store
+/dist
