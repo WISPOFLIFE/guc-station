@@ -1,6 +1,22 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod equal_row;
+#[cfg(windows)]
+mod pdf;
+/// Elsewhere the viewer explains itself and the file can still be downloaded.
+#[cfg(not(windows))]
+mod pdf {
+    #[derive(Debug)]
+    pub struct Document {
+        pub pages: Vec<(f32, f32)>,
+    }
+    pub fn open(_: &[u8]) -> Result<Document, String> {
+        Err("Viewing PDFs inside the app needs Windows. Download the file instead.".into())
+    }
+    pub fn render(_: &Document, _: usize, _: u32) -> Result<Vec<u8>, String> {
+        Err(String::new())
+    }
+}
 mod screens;
 mod settings;
 mod theme;
@@ -17,7 +33,7 @@ use guc::creds;
 use iced::widget::{scrollable, text_editor};
 use iced::{Size, Subscription, Task, Theme, window};
 use settings::Settings;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use url::Url;
@@ -257,7 +273,89 @@ impl ShownImage {
     }
 }
 
+/// Where a viewed PDF came from, so Download saves it where the normal button would.
+#[derive(Debug, Clone)]
+pub enum PdfSource {
+    Cms { url: Url, title: String, folder: String },
+    Mail(mail::Attachment),
+}
+
+impl PdfSource {
+    pub fn title(&self) -> String {
+        match self {
+            PdfSource::Cms { title, .. } => title.replace('_', " "),
+            PdfSource::Mail(a) => a.name.clone(),
+        }
+    }
+}
+
+/// An open PDF. Only pages near the visible part are drawn, so long slide
+/// decks stay light; drawn pages are kept as small PNGs.
+pub struct PdfView {
+    /// Tells this PDF's results apart from one opened before it.
+    pub id: u64,
+    pub source: PdfSource,
+    pub doc: Load<Arc<pdf::Document>>,
+    /// The file itself, kept for Download so it isn't fetched twice.
+    pub bytes: Option<Arc<Vec<u8>>>,
+    /// Drawn pages and the pixel width each was drawn at.
+    pub pages: HashMap<usize, (iced::widget::image::Handle, u32)>,
+    pub drawing: HashSet<usize>,
+    pub failed: HashSet<usize>,
+    /// 1.0 fits the page to the window, up to a comfortable reading width.
+    pub zoom: f32,
+    pub scroll: f32,
+    pub view_height: f32,
+    pub saving: bool,
+}
+
+pub const PDF_GAP: f32 = 14.0;
+const PDF_ZOOMS: [f32; 7] = [0.5, 0.67, 0.8, 1.0, 1.25, 1.5, 2.0];
+/// Pages wider than this at 100% are hard to read across.
+const PDF_FIT_MAX: f32 = 1000.0;
+
+pub fn pdf_scroll_id() -> scrollable::Id {
+    scrollable::Id::new("pdf-pages")
+}
+
+impl PdfView {
+    /// Page width on screen for a given space to fit into.
+    pub fn page_width(&self, available: f32) -> f32 {
+        (available.min(PDF_FIT_MAX) * self.zoom).max(160.0)
+    }
+
+    /// Each page's top and height on screen, in order.
+    pub fn layout(&self, width: f32) -> Vec<(f32, f32)> {
+        let Load::Ready(doc) = &self.doc else { return Vec::new() };
+        let mut top = 0.0;
+        doc.pages
+            .iter()
+            .map(|&(w, h)| {
+                let height = width * h / w.max(1.0);
+                let slot = (top, height);
+                top += height + PDF_GAP;
+                slot
+            })
+            .collect()
+    }
+
+    /// Pages on screen, plus some room either side so scrolling doesn't show blanks.
+    pub fn visible(&self, width: f32) -> Vec<usize> {
+        let (from, to) = (self.scroll - self.view_height * 0.5, self.scroll + self.view_height * 1.5);
+        self.layout(width).iter().enumerate().filter(|(_, (top, h))| top + h >= from && *top <= to).map(|(i, _)| i).collect()
+    }
+
+    /// The page at the top third of the view, counting from 1.
+    pub fn current_page(&self, width: f32) -> usize {
+        let line = self.scroll + self.view_height * 0.3;
+        let slots = self.layout(width);
+        slots.iter().position(|(top, h)| top + h >= line).unwrap_or(slots.len().saturating_sub(1)) + 1
+    }
+}
+
 pub struct Workspace {
+    pub pdf: Option<PdfView>,
+    pub next_pdf_id: u64,
     /// Where downloads are saved; the app keeps it in step with Settings.
     pub downloads: PathBuf,
     pub client: Client,
@@ -395,6 +493,15 @@ pub enum Message {
     OpenLink(Url, String),
     Downloaded(Result<PathBuf, String>),
 
+    ViewPdf(PdfSource),
+    PdfLoaded(u64, Result<(Arc<pdf::Document>, Arc<Vec<u8>>), String>),
+    PdfDrawn(u64, usize, u32, Result<Vec<u8>, String>),
+    PdfScrolled(f32, f32),
+    /// -1 zooms out a step, 1 zooms in, 0 fits the window.
+    PdfZoom(i32),
+    PdfSave,
+    PdfSaved(Result<PathBuf, String>),
+    ClosePdf,
     MailFolder(Folder),
     MailPage(u32),
     MailQuery(String),
@@ -632,6 +739,8 @@ impl App {
 impl Workspace {
     fn new(client: Client, home: &Page, size: Size, downloads: PathBuf) -> Self {
         Workspace {
+            pdf: None,
+            next_pdf_id: 0,
             downloads,
             client,
             screen: Screen::Home,
@@ -699,6 +808,7 @@ impl Workspace {
         }
         self.screen = screen;
         self.detail = None;
+        self.pdf = None;
         let load = match screen {
             Screen::Home => Task::batch([
                 self.load_section(Section::Notifications, false),
@@ -870,6 +980,35 @@ impl Workspace {
             _ => {}
         }
         Task::none()
+    }
+
+    /// Space the PDF's pages fit into: the page area minus its padding.
+    pub fn pdf_area(&self) -> f32 {
+        (self.content_width() - 24.0).max(200.0)
+    }
+
+    /// Starts drawing the visible pages that aren't drawn sharp enough yet.
+    fn draw_pdf_pages(&mut self) -> Task<Message> {
+        let area = self.pdf_area();
+        let Some(v) = &mut self.pdf else { return Task::none() };
+        let Load::Ready(doc) = &v.doc else { return Task::none() };
+        let width = v.page_width(area);
+        // Drawn at 1.5x for sharp text on scaled displays.
+        let pixels = (width * 1.5).clamp(400.0, 3000.0).round() as u32;
+        let mut tasks = Vec::new();
+        for page in v.visible(width) {
+            let sharp = v.pages.get(&page).is_some_and(|(_, drawn)| *drawn as f32 >= pixels as f32 * 0.8);
+            if sharp || v.drawing.contains(&page) || v.failed.contains(&page) {
+                continue;
+            }
+            v.drawing.insert(page);
+            let (doc, id) = (doc.clone(), v.id);
+            tasks.push(Task::perform(
+                async move { tokio::task::spawn_blocking(move || pdf::render(&doc, page, pixels)).await.unwrap_or_else(|e| Err(e.to_string())) },
+                move |r| Message::PdfDrawn(id, page, pixels, r),
+            ));
+        }
+        Task::batch(tasks)
     }
 
     fn load_mail(&mut self, force: bool) -> Task<Message> {
@@ -1064,6 +1203,90 @@ impl Workspace {
                 });
             }
 
+            Message::ViewPdf(source) => {
+                self.next_pdf_id += 1;
+                let id = self.next_pdf_id;
+                self.pdf = Some(PdfView {
+                    id,
+                    source: source.clone(),
+                    doc: Load::Loading,
+                    bytes: None,
+                    pages: HashMap::new(),
+                    drawing: HashSet::new(),
+                    failed: HashSet::new(),
+                    zoom: 1.0,
+                    scroll: 0.0,
+                    view_height: self.size.height,
+                    saving: false,
+                });
+                let client = self.client.clone();
+                return Task::batch([
+                    Task::perform(load_pdf(client, source), move |r| Message::PdfLoaded(id, r)),
+                    scrollable::scroll_to(pdf_scroll_id(), scrollable::AbsoluteOffset { x: 0.0, y: 0.0 }),
+                ]);
+            }
+            Message::PdfLoaded(id, r) => {
+                let Some(v) = self.pdf.as_mut().filter(|v| v.id == id) else { return Task::none() };
+                match r {
+                    Ok((doc, bytes)) => {
+                        v.doc = Load::Ready(doc);
+                        v.bytes = Some(bytes);
+                        return self.draw_pdf_pages();
+                    }
+                    Err(e) => v.doc = Load::Failed(e),
+                }
+            }
+            Message::PdfDrawn(id, page, width, r) => {
+                let Some(v) = self.pdf.as_mut().filter(|v| v.id == id) else { return Task::none() };
+                v.drawing.remove(&page);
+                match r {
+                    Ok(png) => {
+                        v.pages.insert(page, (iced::widget::image::Handle::from_bytes(png), width));
+                    }
+                    Err(_) => {
+                        v.failed.insert(page);
+                    }
+                }
+                // Scrolling may have moved on while this page was drawn.
+                return self.draw_pdf_pages();
+            }
+            Message::PdfScrolled(offset, height) => {
+                if let Some(v) = &mut self.pdf {
+                    v.scroll = offset;
+                    v.view_height = height;
+                }
+                return self.draw_pdf_pages();
+            }
+            Message::PdfZoom(step) => {
+                let Some(v) = &mut self.pdf else { return Task::none() };
+                let at = PDF_ZOOMS.iter().position(|z| (*z - v.zoom).abs() < 0.01).unwrap_or(3) as i32;
+                let next = if step == 0 { 1.0 } else { PDF_ZOOMS[(at + step).clamp(0, PDF_ZOOMS.len() as i32 - 1) as usize] };
+                // Keep the same spot in view.
+                let y = v.scroll * next / v.zoom;
+                v.zoom = next;
+                v.scroll = y;
+                return Task::batch([scrollable::scroll_to(pdf_scroll_id(), scrollable::AbsoluteOffset { x: 0.0, y }), self.draw_pdf_pages()]);
+            }
+            Message::PdfSave => {
+                let Some(v) = &mut self.pdf else { return Task::none() };
+                let Some(bytes) = v.bytes.clone() else { return Task::none() };
+                v.saving = true;
+                let (dir, name) = match &v.source {
+                    PdfSource::Cms { url, title, folder } => (self.downloads.join(tools::folder_name(folder)), tools::saved_name(title, url)),
+                    PdfSource::Mail(a) => (self.downloads.join("Mail"), tools::attachment_file_name(&a.name)),
+                };
+                return Task::perform(async move { tools::write_file(&dir, &name, &bytes).await }, Message::PdfSaved);
+            }
+            Message::PdfSaved(r) => {
+                if let Some(v) = &mut self.pdf {
+                    v.saving = false;
+                }
+                self.notice = Some(match r {
+                    Ok(path) => Notice::Info(format!("Saved to {}", path.display())),
+                    Err(e) => Notice::Error(format!("Couldn't save it: {e}")),
+                });
+            }
+            Message::ClosePdf => self.pdf = None,
             Message::MailFolder(f) => {
                 self.mail.folder = f;
                 self.mail.composing = false;
@@ -1248,6 +1471,20 @@ impl Workspace {
         }
         Task::none()
     }
+}
+
+/// Fetches a PDF into memory and opens it. Nothing is written to disk.
+async fn load_pdf(client: Client, source: PdfSource) -> Result<(Arc<pdf::Document>, Arc<Vec<u8>>), String> {
+    let bytes = match &source {
+        PdfSource::Cms { url, .. } => client.0.get(url.as_str()).await.map_err(|e| e.to_string())?.bytes,
+        PdfSource::Mail(a) => mail::attachment_bytes(&client.0, &a.id).await.map_err(|e| e.to_string())?,
+    };
+    tokio::task::spawn_blocking(move || {
+        let doc = pdf::open(&bytes)?;
+        Ok((Arc::new(doc), Arc::new(bytes)))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 fn sign_in(login: String, password: String) -> Task<Message> {

@@ -229,6 +229,7 @@ fn update_dialog(dialog: &UpdateDialog) -> El<'_> {
 
 fn shell<'a>(app: &'a App, ws: &'a Workspace) -> El<'a> {
     let body: El<'a> = match ws.screen {
+        _ if ws.pdf.is_some() => pdf_viewer(ws, ws.pdf.as_ref().unwrap()),
         Screen::Home => home(ws),
         Screen::Section(s) => match (&ws.detail, s) {
             (Some(d), _) => detail(d, s),
@@ -255,8 +256,8 @@ fn shell<'a>(app: &'a App, ws: &'a Workspace) -> El<'a> {
         };
         content = content.push(container(banner(msg, is_err, Some(Message::DismissNotice))).padding([12, 32]));
     }
-    // Mail manages its own scrolling panes.
-    let body: El<'a> = if ws.screen == Screen::Mail {
+    // Mail and the PDF viewer manage their own scrolling.
+    let body: El<'a> = if ws.screen == Screen::Mail || ws.pdf.is_some() {
         container(body).padding([24, 32]).height(Length::Fill).into()
     } else {
         scrollable(container(body).padding([28, 32]).width(Length::Fill)).id(crate::content_scroll_id()).height(Length::Fill).into()
@@ -795,16 +796,20 @@ fn mail(ws: &Workspace) -> El<'_> {
             if !files.is_empty() {
                 let mut list = Column::new().spacing(2);
                 for a in files {
+                    let mut line = row![text(a.name.as_str()).size(14).width(Length::Fill), muted(file_size(a.size)).size(12)]
+                        .spacing(12)
+                        .align_y(Alignment::Center);
+                    if crate::tools::is_pdf_name(&a.name) || a.content_type.eq_ignore_ascii_case("application/pdf") {
+                        line = line.push(
+                            button(text("View").size(13).font(theme::MEDIUM))
+                                .padding([4, 10])
+                                .style(theme::secondary_button)
+                                .on_press(Message::ViewPdf(crate::PdfSource::Mail(a.clone()))),
+                        );
+                    }
+                    line = line.push(accent_text("Download").size(13).font(theme::MEDIUM));
                     list = list.push(
-                        button(
-                            row![
-                                text(a.name.as_str()).size(14).width(Length::Fill),
-                                muted(file_size(a.size)).size(12),
-                                accent_text("Download").size(13).font(theme::MEDIUM),
-                            ]
-                            .spacing(12)
-                            .align_y(Alignment::Center),
-                        )
+                        button(line)
                         .padding([7, 8])
                         .width(Length::Fill)
                         .style(theme::list_row(false))
@@ -980,6 +985,82 @@ fn compose(d: &Draft) -> El<'_> {
     .align_y(Alignment::Center);
     let content = content.push(actions).padding(24).height(Length::Fill).max_width(READING_WIDTH);
     container(content).center_x(Length::Fill).height(Length::Fill).into()
+}
+
+fn pdf_viewer<'a>(ws: &'a Workspace, v: &'a crate::PdfView) -> El<'a> {
+    let width = v.page_width(ws.pdf_area());
+    let ready = matches!(v.doc, Load::Ready(_));
+    let pages_note = match &v.doc {
+        Load::Ready(doc) => format!("Page {} of {}", v.current_page(width), doc.pages.len()),
+        _ => String::new(),
+    };
+    let zoom_button = |label: &'static str, step: i32| {
+        button(text(label).size(15).font(theme::MEDIUM).center()).width(34).padding([5, 0]).style(theme::ghost_button).on_press_maybe(ready.then_some(Message::PdfZoom(step)))
+    };
+    let header = row![
+        ghost("Back", Message::ClosePdf),
+        column![text(v.source.title()).size(18).font(theme::SEMIBOLD).wrapping(text::Wrapping::None), muted(pages_note).size(12)]
+            .spacing(2)
+            .width(Length::Fill),
+        zoom_button("−", -1),
+        button(text(format!("{:.0}%", v.zoom * 100.0)).size(13).width(48).center())
+            .padding([6, 0])
+            .style(theme::ghost_button)
+            .on_press_maybe(ready.then_some(Message::PdfZoom(0))),
+        zoom_button("+", 1),
+        button(text(if v.saving { "Saving…" } else { "Download" }).size(14))
+            .padding([8, 14])
+            .style(theme::secondary_button)
+            .on_press_maybe((v.bytes.is_some() && !v.saving).then_some(Message::PdfSave)),
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center);
+
+    let body: El<'a> = match &v.doc {
+        Load::Idle | Load::Loading => center(loader("Opening the PDF…")).into(),
+        Load::Failed(e) => {
+            let download_instead = match &v.source {
+                crate::PdfSource::Cms { url, title, .. } => Message::OpenLink(url.clone(), title.clone()),
+                crate::PdfSource::Mail(a) => Message::SaveAttachment(a.clone()),
+            };
+            center(column![banner(e.clone(), true, None), row![secondary("Download it instead", download_instead)]].spacing(12).max_width(520)).into()
+        }
+        Load::Ready(_) => {
+            let shown = v.visible(width);
+            let mut pages = Column::new().spacing(crate::PDF_GAP).align_x(Alignment::Center);
+            for (i, (_, height)) in v.layout(width).into_iter().enumerate() {
+                let drawn = shown.contains(&i).then(|| v.pages.get(&i)).flatten();
+                let page: El<'a> = match drawn {
+                    Some((handle, _)) => image(handle.clone()).width(width).height(height).content_fit(iced::ContentFit::Fill).into(),
+                    None => container(if v.failed.contains(&i) { muted("This page couldn't be drawn.").size(13) } else { muted("").size(13) })
+                        .center_x(width)
+                        .center_y(height)
+                        .style(theme::pdf_page)
+                        .into(),
+                };
+                pages = pages.push(page);
+            }
+            let on_scroll = |vp: scrollable::Viewport| Message::PdfScrolled(vp.absolute_offset().y, vp.bounds().height);
+            // Zoomed past the window, the pages scroll sideways too.
+            if width > ws.pdf_area() {
+                scrollable(container(pages).padding([4, 0]))
+                    .id(crate::pdf_scroll_id())
+                    .direction(scrollable::Direction::Both { vertical: scrollable::Scrollbar::default(), horizontal: scrollable::Scrollbar::default() })
+                    .on_scroll(on_scroll)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into()
+            } else {
+                scrollable(container(pages).center_x(Length::Fill).padding([4, 0]))
+                    .id(crate::pdf_scroll_id())
+                    .on_scroll(on_scroll)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into()
+            }
+        }
+    };
+    column![header, body].spacing(14).height(Length::Fill).into()
 }
 
 fn file_size(bytes: u64) -> String {

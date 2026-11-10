@@ -222,7 +222,7 @@ async fn save_path(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
 /// named after its title on the CMS.
 pub async fn download(client: Client, url: Url, title: String, folder: String, downloads: PathBuf) -> Result<PathBuf, String> {
     let resp = client.0.get(url.as_str()).await.map_err(|e| e.to_string())?;
-    let dir = downloads.join(sanitize(&folder));
+    let dir = downloads.join(folder_name(&folder));
     tokio::fs::create_dir_all(&dir).await.map_err(|e| e.to_string())?;
     let path = save_path(&dir, &saved_name(&title, &resp.url), &resp.bytes).await;
     tokio::fs::write(&path, &resp.bytes).await.map_err(|e| e.to_string())?;
@@ -260,6 +260,21 @@ pub async fn save_attachment(client: Client, attachment: Attachment, downloads: 
     }
     let dir = downloads.join("Mail");
     write_attachment(&dir, &attachment_file_name(&attachment.name), &bytes).await
+}
+
+/// The folder name used for a course's downloads.
+pub fn folder_name(course: &str) -> String {
+    sanitize(course)
+}
+
+/// Whether a link or attachment can be shown in the app's PDF viewer.
+pub fn is_pdf_name(name: &str) -> bool {
+    name.trim().to_lowercase().ends_with(".pdf")
+}
+
+/// Saves bytes already in memory, like a download would.
+pub async fn write_file(dir: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+    write_attachment(dir, name, bytes).await
 }
 
 async fn write_attachment(dir: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf, String> {

@@ -3,7 +3,8 @@
 
 use crate::theme::{self, tokens};
 use crate::views::{accent_text, banner, ghost, link, loaded, loader, masonry, muted, page_header, panel, secondary, subheading};
-use crate::{Load, Message, Screen, Workspace};
+use crate::tools;
+use crate::{Load, Message, PdfSource, Screen, Workspace};
 use chrono::{Datelike, Local, NaiveDate, NaiveTime};
 use guc::academic::{Class, CmsWeek, CourseAttendance, CourseGrades, Exam, Quiz, Schedule};
 use guc::portal::Section;
@@ -540,15 +541,21 @@ fn cms_week<'a>(ws: &'a Workspace, w: &'a CmsWeek) -> Option<El<'a>> {
         }
         // "3 - CSEN701_Lecture02_Overview of Processors" reads better with underscores as spaces.
         let title = i.title.replace('_', " ");
+        let mut line = row![column![text(title).size(14), muted(i.kind.as_str()).size(12)].spacing(2).width(Length::Fill)]
+            .spacing(12)
+            .align_y(Alignment::Center);
+        if tools::is_pdf_name(i.url.path()) {
+            let folder = ws.cms.course.as_ref().map(|(t, _)| t.clone()).unwrap_or_else(|| "Files".into());
+            line = line.push(
+                button(text("View").size(13).font(theme::MEDIUM))
+                    .padding([4, 10])
+                    .style(theme::secondary_button)
+                    .on_press(Message::ViewPdf(PdfSource::Cms { url: i.url.clone(), title: i.title.clone(), folder })),
+            );
+        }
+        line = line.push(accent_text("Download").size(13).font(theme::MEDIUM));
         list = list.push(
-            button(
-                row![
-                    column![text(title).size(14), muted(i.kind.as_str()).size(12)].spacing(2).width(Length::Fill),
-                    accent_text("Download").size(13).font(theme::MEDIUM),
-                ]
-                .spacing(12)
-                .align_y(Alignment::Center),
-            )
+            button(line)
             .padding([10, 10])
             .width(Length::Fill)
             .style(theme::list_row(false))

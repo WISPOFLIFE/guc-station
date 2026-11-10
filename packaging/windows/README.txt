@@ -1,4 +1,4 @@
-GUC Station 0.2.0
+GUC Station 0.3.0
 A desktop app for the GUC student portal, CMS and university mail.
 This is an unofficial app, not made or endorsed by the German University in Cairo.
 

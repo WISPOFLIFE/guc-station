@@ -302,6 +302,12 @@ pub fn editor(theme: &Theme, status: text_editor::Status) -> text_editor::Style 
     }
 }
 
+/// A PDF page that hasn't been drawn yet: paper-coloured, so drawing it doesn't flash.
+pub fn pdf_page(theme: &Theme) -> container::Style {
+    let t = tokens(theme);
+    container::Style { background: Some(mix(Color::WHITE, t.bg, 0.12).into()), text_color: Some(Color::from_rgb(0.45, 0.45, 0.45)), ..Default::default() }
+}
+
 /// The dimmed backdrop behind a pop-up.
 pub fn scrim(_theme: &Theme) -> container::Style {
     container::Style { background: Some(Color { a: 0.55, ..Color::BLACK }.into()), ..Default::default() }

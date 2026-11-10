@@ -50,6 +50,8 @@ deleting them again; it never sends. In the app, Settings → Troubleshooting sa
 | `src/creds.rs` | Saved sign-in in Windows Credential Manager |
 | `src/main.rs`, `src/views.rs`, `src/screens.rs` | App state and screens |
 | `src/theme.rs`, `src/settings.rs`, `src/tools.rs`, `src/equal_row.rs` | Themes, preferences, downloads, calculators, layout |
+| `src/pdf.rs` | In-app PDF viewing with Windows' built-in PDF engine |
+| `src/update.rs` | Checking GitHub releases and updating in place |
 | `src/bin/probe.rs` | Saves real pages for writing parsers |
 | `assets/` | IBM Plex Sans (with its licence) and the app's icons and pixel art |
 | `packaging/windows/README.txt` | The read-me that goes in the download zip |
