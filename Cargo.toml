@@ -43,8 +43,9 @@ sha2 = "0.10"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [target.'cfg(windows)'.dependencies]
+tray-icon = "0.26.1"
 # Already in the build through the graphics stack; this adds only the PDF bindings.
-windows = { version = "0.52", features = ["Data_Pdf", "Foundation", "Storage_Streams", "Win32_System_Com"] }
+windows = { version = "0.52", features = ["Data_Pdf", "Data_Xml_Dom", "Foundation", "Storage_Streams", "UI_Notifications", "Win32_Foundation", "Win32_Security", "Win32_System_Com", "Win32_System_Registry", "Win32_System_Threading"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"

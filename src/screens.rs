@@ -2,7 +2,7 @@
 //! the week schedule, today's classes, exams, grades, attendance and CMS.
 
 use crate::theme::{self, tokens};
-use crate::views::{accent_text, banner, ghost, link, loaded, loader, masonry, muted, page_header, panel, secondary, subheading};
+use crate::views::{COLUMN_GAP, accent_text, banner, ghost, link, loaded, loader, masonry, muted, page_header, panel, secondary, subheading};
 use crate::tools;
 use crate::{Load, Message, PdfSource, Screen, Workspace};
 use chrono::{Datelike, Local, NaiveDate, NaiveTime};
@@ -227,6 +227,64 @@ fn next_class_day(s: &Schedule, today: &str) -> Option<&'static str> {
 
 // ---------------------------------------------------------------- exams
 
+/// Exams from today on, soonest first. Ones without a readable date are left out.
+fn upcoming_exams(ws: &Workspace) -> Vec<&Exam> {
+    let today = Local::now().date_naive();
+    let mut list: Vec<&Exam> = ws.exams.iter().flatten().filter(|e| e.date.is_some_and(|d| d >= today)).collect();
+    list.sort_by(|a, b| (a.date, &a.start).cmp(&(b.date, &b.start)));
+    list
+}
+
+/// Height of Home's next-exam panel, or 0 when it isn't shown.
+pub fn next_exam_height(ws: &Workspace) -> f32 {
+    match upcoming_exams(ws).len() {
+        0 => 0.0,
+        1 => 128.0,
+        _ => 150.0,
+    }
+}
+
+/// Home's countdown to the next exam. Nothing at all when none is coming up,
+/// which is most of the semester.
+pub fn next_exam(ws: &Workspace) -> Option<El<'_>> {
+    let upcoming = upcoming_exams(ws);
+    let e = *upcoming.first()?;
+    let date = e.date?;
+    let days = (date - Local::now().date_naive()).num_days();
+    let (big, small) = match days {
+        0 => ("Today".to_string(), format!("at {}", e.start)),
+        1 => ("1".to_string(), "day left".to_string()),
+        n => (n.to_string(), "days left".to_string()),
+    };
+    let countdown = column![accent_text(big).size(if days == 0 { 20 } else { 28 }).font(theme::SEMIBOLD), muted(small).size(12)]
+        .spacing(0)
+        .align_x(Alignment::Center)
+        .width(84);
+    let name = if e.course.is_empty() { e.code.as_str() } else { e.course.as_str() };
+    let mut when = vec![date.format("%a %-d %b").to_string(), format!("{}–{}", e.start, e.end)];
+    if !e.kind.is_empty() {
+        when.push(e.kind.clone());
+    }
+    let course = column![text(name).size(15).font(theme::SEMIBOLD), muted(when.join(" · ")).size(12)].spacing(3).width(Length::Fill);
+    let place = column![text(e.hall.as_str()).size(14), muted("Hall").size(12)].spacing(3).width(96);
+    let seat = column![text(e.seat.as_str()).size(20).font(theme::SEMIBOLD), muted("Seat").size(12)]
+        .spacing(1)
+        .align_x(Alignment::End)
+        .width(56);
+
+    let head = row![subheading("Next exam"), horizontal_space(), link("All exams", Message::Navigate(Screen::Section(Section::Exams)))]
+        .align_y(Alignment::Center);
+    let mut body = column![head, row![countdown, course, place, seat].spacing(16).align_y(Alignment::Center)].spacing(12);
+    if let Some(then) = upcoming.get(1) {
+        let rest = upcoming.len() - 2;
+        let more = if rest > 0 { format!(", then {rest} more") } else { String::new() };
+        let then_name = if then.course.is_empty() { then.code.as_str() } else { then.course.as_str() };
+        let then_date = then.date.map(|d| d.format("%a %-d %b").to_string()).unwrap_or_default();
+        body = body.push(muted(format!("After that: {then_name} on {then_date}{more}")).size(12));
+    }
+    Some(panel(body))
+}
+
 pub fn exams(ws: &Workspace) -> El<'_> {
     let header = page_header("Exam schedule".into(), None, portal_actions(ws, Section::Exams));
     let Some(list) = &ws.exams else { return column![header, while_loading(ws, Section::Exams, "Loading your exam seats…")].spacing(20).into() };
@@ -385,6 +443,39 @@ fn trim(v: f32) -> String {
 
 // ---------------------------------------------------------------- attendance
 
+/// Share of recorded sessions missed at which each warning level starts.
+/// GUC drops a course past 25%.
+const ATTENDANCE_LIMIT: f32 = 0.25;
+const LEVEL_STARTS: [f32; 3] = [0.10, 0.15, 0.20];
+
+/// 0 is fine, 1 to 3 are warning levels, 4 is past the limit.
+fn attendance_level(c: &CourseAttendance) -> (usize, f32) {
+    let total = c.sessions.len();
+    if total == 0 {
+        return (0, 0.0);
+    }
+    let share = c.absences() as f32 / total as f32;
+    let level = if share > ATTENDANCE_LIMIT { 4 } else { LEVEL_STARTS.iter().filter(|&&s| share >= s).count() };
+    (level, share)
+}
+
+fn level_name(level: usize) -> &'static str {
+    match level {
+        0 => "Fine",
+        1 => "Level 1 warning",
+        2 => "Level 2 warning",
+        3 => "Level 3 warning",
+        _ => "Past the limit",
+    }
+}
+
+/// How many more sessions can be missed, if no more are recorded, before
+/// passing the limit.
+fn absences_left(c: &CourseAttendance) -> usize {
+    let allowed = (c.sessions.len() as f32 * ATTENDANCE_LIMIT).floor() as usize;
+    allowed.saturating_sub(c.absences())
+}
+
 pub fn attendance(ws: &Workspace) -> El<'_> {
     let header = page_header(
         "Attendance".into(),
@@ -395,15 +486,95 @@ pub fn attendance(ws: &Workspace) -> El<'_> {
         if courses.is_empty() {
             return panel(muted("No courses this semester.").size(14));
         }
-        let items = courses.iter().map(|c| (panel(course_attendance(c)), 2 + usize::from(c.absences() > 0) + usize::from(c.warning.is_some()))).collect();
-        masonry(items, ws.columns(420.0))
+        let mut warned: Vec<(&CourseAttendance, usize, f32)> = courses
+            .iter()
+            .map(|c| {
+                let (level, share) = attendance_level(c);
+                (c, level, share)
+            })
+            .filter(|(c, level, _)| *level > 0 || c.warning.is_some())
+            .collect();
+        warned.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.total_cmp(&a.2)));
+        let summary: El<'_> = if warned.is_empty() {
+            panel(muted("No attendance warnings. You're under 10% absences in every course.").size(14))
+        } else {
+            let mut list = Column::new().spacing(8).push(subheading("Warnings"));
+            for (c, level, share) in &warned {
+                let (code, name) = c.course.split_once(" - ").unwrap_or(("", c.course.as_str()));
+                let label = if *level > 0 { level_name(*level).to_string() } else { "Portal warning".to_string() };
+                list = list.push(
+                    row![
+                        level_text(label, (*level).max(1)).size(13).font(theme::SEMIBOLD).width(140),
+                        text(name).size(14).width(Length::Fill),
+                        muted(code).size(12),
+                        muted(format!("{:.0}% missed", share * 100.0)).size(12).width(90),
+                    ]
+                    .spacing(12)
+                    .align_y(Alignment::Center),
+                );
+            }
+            list = list.push(
+                muted("Levels start at 10%, 15% and 20% of recorded sessions missed, counted by this app. A warning from the portal itself is what counts officially.")
+                    .size(12),
+            );
+            panel(list)
+        };
+        let items = courses
+            .iter()
+            .map(|c| (panel(course_attendance(c)), 3 + usize::from(c.absences() > 0) + usize::from(c.warning.is_some())))
+            .collect();
+        column![summary, masonry(items, ws.columns(420.0))].spacing(COLUMN_GAP).into()
     });
     column![header, body].spacing(20).into()
+}
+
+/// Text coloured by how serious a warning level is.
+fn level_text<'a>(s: impl text::IntoFragment<'a>, level: usize) -> text::Text<'a> {
+    text(s).style(move |t: &Theme| {
+        let k = tokens(t);
+        text::Style { color: Some(match level {
+            0 => k.muted,
+            1 | 2 => k.accent,
+            _ => k.danger,
+        }) }
+    })
+}
+
+/// A bar filling up toward the 25% limit.
+fn limit_bar<'a>(share: f32, level: usize) -> El<'a> {
+    let filled = ((share / ATTENDANCE_LIMIT).min(1.0) * 100.0).round() as u16;
+    let fill = move |t: &Theme| {
+        let k = tokens(t);
+        container::Style {
+            background: Some(match level {
+                0 => k.muted,
+                1 | 2 => k.accent,
+                _ => k.danger,
+            }
+            .into()),
+            border: iced::Border { radius: 3.0.into(), ..Default::default() },
+            ..Default::default()
+        }
+    };
+    let track = |t: &Theme| container::Style {
+        background: Some(tokens(t).border.into()),
+        border: iced::Border { radius: 3.0.into(), ..Default::default() },
+        ..Default::default()
+    };
+    let mut bar = Row::new();
+    if filled > 0 {
+        bar = bar.push(container(Space::new(Length::Fill, 6)).width(Length::FillPortion(filled)).style(fill));
+    }
+    if filled < 100 {
+        bar = bar.push(Space::new(Length::FillPortion(100 - filled), 6));
+    }
+    container(bar).width(Length::Fill).style(track).into()
 }
 
 fn course_attendance(c: &CourseAttendance) -> El<'_> {
     let total = c.sessions.len();
     let missed = c.absences();
+    let (level, share) = attendance_level(c);
     let (code, name) = c.course.split_once(" - ").unwrap_or(("", c.course.as_str()));
     let missed_list = c
         .sessions
@@ -424,6 +595,15 @@ fn course_attendance(c: &CourseAttendance) -> El<'_> {
     .width(Length::Fill);
     if !missed_list.is_empty() {
         info = info.push(muted(format!("Missed: {missed_list}")).size(12));
+    }
+    if total > 0 {
+        let left = absences_left(c);
+        let status = if level == 4 {
+            format!("{}: {:.0}% missed", level_name(level), share * 100.0)
+        } else {
+            format!("{} · {:.0}% missed · {left} more before 25%", level_name(level), share * 100.0)
+        };
+        info = info.push(column![limit_bar(share, level), level_text(status, level).size(12)].spacing(5));
     }
     if let Some(w) = &c.warning {
         info = info.push(banner(format!("Portal warning: {w}"), true, None));

@@ -2,7 +2,7 @@
 
 use crate::screens;
 use crate::theme::{self, AppTheme, tokens};
-use crate::tools::{CalcMsg, GpaMsg};
+use crate::tools::{self, CalcMsg, GpaMsg};
 use crate::update;
 use crate::{App, COMPOSE_TO, Draft, UpdateDialog, LoginForm, Load, MAIL_PAGE_SIZE, Message, Notice, Screen, Session, Workspace};
 use guc::mail::{Compose, Folder};
@@ -10,7 +10,7 @@ use guc::page::{Page, Table};
 use guc::portal::{self, Section};
 use iced::widget::{
     Column, Row, Space, button, center, image, mouse_area, opaque, stack, checkbox, column, container, horizontal_rule, horizontal_space, pick_list, text_editor,
-    row, scrollable, text, text_input,
+    row, scrollable, text, text_input, toggler,
 };
 use iced::{Alignment, Element, Length, Theme};
 use std::sync::LazyLock;
@@ -367,7 +367,10 @@ fn home(ws: &Workspace) -> El<'_> {
     let wide = ws.content_width() >= WIDE_PAGE;
     let page_height = ws.size.height - 56.0 - 62.0 - 20.0;
     let today_height = 92.0 + screens::today_count(ws) as f32 * 55.0;
-    let notification_rows = if wide { ((page_height - today_height - 16.0 - 100.0) / 59.0) as usize } else { 6 }.clamp(3, 30);
+    let exam = screens::next_exam(ws);
+    let exam_height = if exam.is_some() { screens::next_exam_height(ws) + COLUMN_GAP } else { 0.0 };
+    let notification_rows =
+        if wide { ((page_height - exam_height - today_height - 16.0 - 100.0) / 59.0) as usize } else { 6 }.clamp(3, 30);
     let mail_rows = if wide { ((page_height - 100.0) / 66.0) as usize } else { 6 }.clamp(4, 40);
 
     let notifications = panel(column![
@@ -400,15 +403,11 @@ fn home(ws: &Workspace) -> El<'_> {
     ]
     .spacing(14));
 
+    let main = Column::new().push_maybe(exam).push(screens::today(ws)).push(notifications).spacing(COLUMN_GAP);
     let body: El<'_> = if wide {
-        row![
-            column![screens::today(ws), notifications].spacing(COLUMN_GAP).width(Length::FillPortion(3)),
-            container(inbox).width(Length::FillPortion(2)),
-        ]
-        .spacing(COLUMN_GAP)
-        .into()
+        row![main.width(Length::FillPortion(3)), container(inbox).width(Length::FillPortion(2))].spacing(COLUMN_GAP).into()
     } else {
-        column![screens::today(ws), notifications, inbox].spacing(COLUMN_GAP).into()
+        main.push(inbox).into()
     };
     column![header, body].spacing(20).into()
 }
@@ -647,6 +646,32 @@ fn notification_list(p: &Page, limit: usize) -> El<'_> {
         col = col.push(container(muted(format!("{} more", items.len() - limit)).size(12)).padding([8, 12]));
     }
     col.into()
+}
+
+/// The portal's notifications as (key, headline, details), for Windows
+/// notifications. The key is the raw title and date, which stay the same
+/// across loads.
+pub(crate) fn notification_items(p: &Page) -> Vec<(String, String, String)> {
+    let Some(t) = p.tables.iter().find(|t| t.rows.first().is_some_and(|h| h.iter().any(|c| c.eq_ignore_ascii_case("title")))) else {
+        return Vec::new();
+    };
+    let header: Vec<String> = t.rows[0].iter().map(|c| c.to_lowercase()).collect();
+    let find = |name: &str| header.iter().position(|c| c.contains(name));
+    let (title, date, staff) = (find("title"), find("date"), find("staff"));
+    let get = |r: &Vec<String>, c: Option<usize>| c.and_then(|c| r.get(c)).map(String::as_str).unwrap_or("").to_string();
+    t.rows[1..]
+        .iter()
+        .filter(|r| !get(r, title).is_empty())
+        .map(|r| {
+            let (headline, course) = split_notification_title(&get(r, title));
+            let details = [course.unwrap_or_default(), get(r, staff), short_date(&get(r, date))]
+                .into_iter()
+                .filter(|m| !m.is_empty())
+                .collect::<Vec<_>>()
+                .join(" · ");
+            (format!("{}|{}", get(r, title), get(r, date)), headline, details)
+        })
+        .collect()
 }
 
 /// "Notification System: Midterm Exam [Group: Winter 2026 - DMET 702 - 7DMET1 (Lecture)]"
@@ -1185,6 +1210,23 @@ fn grade_calc(ws: &Workspace) -> El<'_> {
     }
     rows = rows.push(row![secondary("Add component", Message::Calc(CalcMsg::Add))]);
 
+    // Filling in from the grades page saves typing scores the portal already has.
+    let fill: El<'_> = match &ws.grades {
+        Load::Ready(courses) if !courses.is_empty() => {
+            let names: Vec<String> = courses.iter().map(|c| c.course.clone()).collect();
+            row![
+                muted("Fill in from your grades").size(13),
+                pick_list(names, None::<String>, |c| Message::Calc(CalcMsg::Fill(c))).placeholder("Choose a course").text_size(14).width(Length::Fill),
+            ]
+            .spacing(12)
+            .align_y(Alignment::Center)
+            .into()
+        }
+        Load::Loading => muted("Loading your grades so you can fill a course in…").size(13).into(),
+        _ => Space::with_height(0).into(),
+    };
+    let rows = column![fill, rows].spacing(16);
+
     let s = ws.calc.summary();
     let mut summary = column![].spacing(10);
     if (s.total_weight - 100.0).abs() > 0.01 {
@@ -1205,6 +1247,30 @@ fn grade_calc(ws: &Workspace) -> El<'_> {
             s.remaining,
             s.earned + s.remaining * s.standing().unwrap_or(0.0) / 100.0
         )).size(14));
+    }
+    if s.remaining > 0.0 {
+        let mut table = Column::new().spacing(6).push(subheading("What you need on the rest")).push(
+            muted(format!("Average needed on the {:.0}% not graded yet (usually the final) for each grade, on GUC's usual cut-offs.", s.remaining)).size(12),
+        );
+        for (letter, cutoff) in tools::LETTER_CUTOFFS {
+            let Some(need) = s.needed(cutoff) else { continue };
+            let (value, faded) = if need <= 0.0 {
+                ("Secured".to_string(), true)
+            } else if need > 100.0 {
+                ("Out of reach".to_string(), true)
+            } else {
+                (format!("{need:.1}%"), false)
+            };
+            table = table.push(
+                row![
+                    text(letter).size(14).font(theme::SEMIBOLD).width(48),
+                    muted(format!("{cutoff:.0}%+")).size(12).width(Length::Fill),
+                    if faded { muted(value).size(14) } else { text(value).size(14).font(theme::MEDIUM) },
+                ]
+                .align_y(Alignment::Center),
+            );
+        }
+        summary = summary.push(Space::with_height(4)).push(table);
     }
 
     column![header, main_and_side(ws, panel(rows), panel(summary))].spacing(20).into()
@@ -1245,6 +1311,18 @@ fn settings<'a>(app: &'a App, ws: &'a Workspace) -> El<'a> {
     if let Some(e) = &app.folder_error {
         downloads = downloads.push(banner(e.clone(), true, None));
     }
+    let background = column![
+            subheading("In the background"),
+            muted("Closing the window keeps GUC Station running in the notification area by the clock. Right-click its icon there to quit.").size(13),
+            toggler(app.settings.start_on_boot)
+                .label("Start with Windows")
+                .text_size(14)
+                .on_toggle(Message::StartOnBootToggled),
+            toggler(app.settings.notifications)
+                .label("Notify me about new mail and portal notifications")
+                .text_size(14)
+                .on_toggle(Message::NotificationsToggled),
+        ].spacing(10);
     let privacy = column![
             subheading("Privacy"),
             muted("GUC Station talks only to apps.guc.edu.eg, cms.guc.edu.eg and mail.guc.edu.eg. Your grades, mail and password never pass through any other server. Checking for updates contacts GitHub, and only when you press the button.").size(14),
@@ -1267,7 +1345,7 @@ fn settings<'a>(app: &'a App, ws: &'a Workspace) -> El<'a> {
     column![
         page_header("Settings".into(), None, vec![]),
         panel(column![subheading("Theme"), picker].spacing(12)),
-        card_grid(vec![account.into(), downloads.into(), updates.into(), privacy.into(), troubleshooting.into()], ws.columns(340.0)),
+        card_grid(vec![account.into(), background.into(), downloads.into(), updates.into(), privacy.into(), troubleshooting.into()], ws.columns(340.0)),
     ]
     .spacing(COLUMN_GAP)
     .into()

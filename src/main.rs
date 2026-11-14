@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod desktop;
 mod equal_row;
 #[cfg(windows)]
 mod pdf;
@@ -39,13 +40,25 @@ use std::sync::Arc;
 use url::Url;
 
 pub const MAIL_PAGE_SIZE: u32 = 40;
+/// How often the app checks for new mail and portal notifications.
+const POLL_EVERY: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+/// More new items than this at once become one summary notification.
+const TOASTS_AT_ONCE: usize = 3;
 
 fn initial_size() -> Size {
     Size::new(1280.0, 820.0)
 }
 
 fn main() -> iced::Result {
+    // Opening GUC Station again brings the running copy's window forward instead.
+    if !desktop::claim_instance() {
+        return Ok(());
+    }
     update::clean_up();
+    // Kept until the app quits; dropping it removes the icon.
+    let _tray = desktop::tray();
+    // Started with Windows: stay in the tray, unless there's no saved sign-in to use.
+    let visible = !(desktop::started_in_background() && creds::load().is_some());
     iced::application("GUC Station", App::update, App::view)
         .theme(App::theme)
         .font(include_bytes!("../assets/fonts/IBMPlexSans-Regular.ttf").as_slice())
@@ -56,6 +69,9 @@ fn main() -> iced::Result {
             size: initial_size(),
             min_size: Some(Size::new(960.0, 640.0)),
             icon: window::icon::from_file_data(include_bytes!("../assets/brand/app-icon-256.png"), None).ok(),
+            visible,
+            // Closing hides the window; the app keeps running in the tray.
+            exit_on_close_request: false,
             ..Default::default()
         })
         .subscription(App::subscription)
@@ -456,6 +472,8 @@ pub struct App {
     pub session: Session,
     /// Current window size; layouts adapt to it.
     pub size: Size,
+    /// Mail and notifications already announced in Windows.
+    pub seen: settings::Seen,
 }
 
 #[derive(Debug, Clone)]
@@ -550,20 +568,80 @@ pub enum Message {
     /// Advances the loading animation.
     Tick,
     Resized(Size),
+    /// The window's close button: hide it and keep running in the tray.
+    HideWindow(window::Id),
+    Desktop(desktop::Wake),
+    StartOnBootToggled(bool),
+    NotificationsToggled(bool),
+    /// Time to check for new mail and portal notifications.
+    Poll,
+    /// (notifications, inbox), each None when it couldn't be fetched.
+    Polled(Option<Vec<(String, String, String)>>, Option<Vec<mail::Summary>>),
 }
 
 impl App {
     fn new() -> (Self, Task<Message>) {
         let settings = Settings::load();
-        match creds::load() {
+        // Rewritten on every start, so the entry follows the exe if it moves.
+        desktop::set_start_on_boot(settings.start_on_boot);
+        let (form, task) = match creds::load() {
             Some((login, password)) => {
                 let form = LoginForm { login: login.clone(), password: password.clone(), remember: true, busy: true, error: None };
-                (App { settings, session: Session::SignedOut(form), size: initial_size(), folder_error: None, picking_folder: false, update: None }, sign_in(login, password))
+                (form, sign_in(login, password))
             }
-            None => (
-                App { settings, session: Session::SignedOut(LoginForm { remember: true, ..Default::default() }), size: initial_size(), folder_error: None, picking_folder: false, update: None },
-                Task::none(),
-            ),
+            None => (LoginForm { remember: true, ..Default::default() }, Task::none()),
+        };
+        let app = App {
+            settings,
+            session: Session::SignedOut(form),
+            size: initial_size(),
+            folder_error: None,
+            picking_folder: false,
+            update: None,
+            seen: settings::Seen::load(),
+        };
+        (app, task)
+    }
+
+    /// Brings the window back from the tray, minimised or not.
+    fn show_window() -> Task<Message> {
+        window::get_oldest().and_then(|id| {
+            Task::batch([window::change_mode(id, window::Mode::Windowed), window::minimize(id, false), window::gain_focus(id)])
+        })
+    }
+
+    /// Turns newly seen mail and notifications into Windows notifications.
+    fn announce(&mut self, notes: Option<Vec<(String, String, String)>>, inbox: Option<Vec<mail::Summary>>) {
+        let mut toasts = Vec::new();
+        if let Some(notes) = notes {
+            let fresh: Vec<_> = notes.into_iter().filter(|(key, ..)| !self.seen.notifications.contains(key)).collect();
+            self.seen.notifications.extend(fresh.iter().map(|(key, ..)| key.clone()));
+            if self.seen.notifications_primed {
+                toasts.extend(summarise(
+                    fresh.into_iter().map(|(_, headline, details)| (headline, details, desktop::Target::Notifications)).collect(),
+                    |n| (format!("{n} new portal notifications"), "Open GUC Station to read them.".into(), desktop::Target::Notifications),
+                ));
+            }
+            self.seen.notifications_primed = true;
+        }
+        if let Some(inbox) = inbox {
+            let fresh: Vec<_> = inbox.into_iter().filter(|m| !self.seen.mail.contains(&m.id)).collect();
+            self.seen.mail.extend(fresh.iter().map(|m| m.id.clone()));
+            if self.seen.mail_primed {
+                toasts.extend(summarise(
+                    fresh
+                        .into_iter()
+                        .filter(|m| !m.is_read)
+                        .map(|m| (m.from, if m.subject.is_empty() { "(no subject)".into() } else { m.subject }, desktop::Target::Mail(m.id)))
+                        .collect(),
+                    |n| (format!("{n} new emails"), "Open GUC Station to read them.".into(), desktop::Target::Mail(String::new())),
+                ));
+            }
+            self.seen.mail_primed = true;
+        }
+        self.seen.save();
+        if self.settings.notifications {
+            desktop::notify(toasts);
         }
     }
 
@@ -577,13 +655,18 @@ impl App {
             Session::SignedOut(form) => form.busy,
             Session::SignedIn(ws) => ws.is_busy(),
         } || matches!(self.update, Some(UpdateDialog::Checking | UpdateDialog::Installing(_)));
-        let resized = window::resize_events().map(|(_, size)| Message::Resized(size));
+        let mut subs = vec![
+            window::resize_events().map(|(_, size)| Message::Resized(size)),
+            window::close_requests().map(Message::HideWindow),
+            Subscription::run(desktop::events).map(Message::Desktop),
+        ];
         if busy {
-            let tick = iced::time::every(std::time::Duration::from_millis(views::LOADER_FRAME_MS)).map(|_| Message::Tick);
-            Subscription::batch([resized, tick])
-        } else {
-            resized
+            subs.push(iced::time::every(std::time::Duration::from_millis(views::LOADER_FRAME_MS)).map(|_| Message::Tick));
         }
+        if self.settings.notifications && matches!(self.session, Session::SignedIn(_)) {
+            subs.push(iced::time::every(POLL_EVERY).map(|_| Message::Poll));
+        }
+        Subscription::batch(subs)
     }
 
     fn view(&self) -> iced::Element<'_, Message> {
@@ -606,6 +689,52 @@ impl App {
             Message::ThemePicked(choice) => {
                 self.settings.theme = choice;
                 self.settings.save();
+                return Task::none();
+            }
+            Message::HideWindow(id) => return window::change_mode(id, window::Mode::Hidden),
+            Message::Desktop(desktop::Wake::Quit) => return iced::exit(),
+            Message::Desktop(desktop::Wake::Show) => {
+                desktop::acknowledge_show();
+                return Self::show_window();
+            }
+            Message::Desktop(desktop::Wake::Open(target)) => {
+                let show = Self::show_window();
+                let Session::SignedIn(ws) = &mut self.session else { return show };
+                let open = match target {
+                    desktop::Target::Notifications => {
+                        let go = ws.open(Screen::Section(Section::Notifications));
+                        Task::batch([go, ws.load_section(Section::Notifications, true)])
+                    }
+                    desktop::Target::Mail(id) => {
+                        let go = ws.open(Screen::Mail);
+                        let mut tasks = vec![go, ws.load_mail(true)];
+                        if !id.is_empty() {
+                            tasks.push(ws.update(Message::MailOpen(id)));
+                        }
+                        Task::batch(tasks)
+                    }
+                };
+                return Task::batch([show, open]);
+            }
+            Message::StartOnBootToggled(on) => {
+                self.settings.start_on_boot = on;
+                self.settings.save();
+                desktop::set_start_on_boot(on);
+                return Task::none();
+            }
+            Message::NotificationsToggled(on) => {
+                self.settings.notifications = on;
+                self.settings.save();
+                return Task::none();
+            }
+            Message::Poll => {
+                return match &self.session {
+                    Session::SignedIn(ws) => poll(ws.client.clone(), ws.sections[&Section::Notifications].clone()),
+                    Session::SignedOut(_) => Task::none(),
+                };
+            }
+            Message::Polled(notes, inbox) => {
+                self.announce(notes, inbox);
                 return Task::none();
             }
             Message::CheckForUpdates => {
@@ -713,8 +842,14 @@ impl App {
                     }
                     let mut ws = Workspace::new(client, &home, self.size, self.settings.downloads());
                     let task = ws.open(Screen::Home);
+                    // The first check right away, so mail that came while the PC was off is announced.
+                    let check = if self.settings.notifications {
+                        poll(ws.client.clone(), ws.sections[&Section::Notifications].clone())
+                    } else {
+                        Task::none()
+                    };
                     self.session = Session::SignedIn(Box::new(ws));
-                    return task;
+                    return Task::batch([task, check]);
                 }
                 Message::SignedIn(Err(e)) => {
                     form.busy = false;
@@ -813,6 +948,7 @@ impl Workspace {
             Screen::Home => Task::batch([
                 self.load_section(Section::Notifications, false),
                 self.load_section(Section::Schedule, false),
+                self.load_section(Section::Exams, false),
                 self.load_mail(false),
             ]),
             Screen::Section(Section::Grades) => self.load_grades(false),
@@ -822,7 +958,9 @@ impl Workspace {
             Screen::Cms => self.load_cms(false),
             Screen::Mail => self.load_mail(false),
             Screen::Gpa => self.load_section(Section::Transcript, false),
-            Screen::GradeCalc | Screen::Settings => Task::none(),
+            // Grades load in the background so the calculator can fill a course in.
+            Screen::GradeCalc => self.load_grades(false),
+            Screen::Settings => Task::none(),
         };
         Task::batch([load, scroll_to_top()])
     }
@@ -1031,6 +1169,7 @@ impl Workspace {
                     Screen::Home => Task::batch([
                         self.load_section(Section::Notifications, true),
                         self.load_section(Section::Schedule, true),
+                        self.load_section(Section::Exams, true),
                         self.load_mail(true),
                     ]),
                     Screen::Section(Section::Grades) => self.load_grades(true),
@@ -1454,6 +1593,11 @@ impl Workspace {
                     }
                 }
             }
+            Message::Calc(tools::CalcMsg::Fill(course)) => {
+                if let Load::Ready(all) = &self.grades && let Some(g) = all.iter().find(|g| g.course == course) {
+                    self.calc.fill_from(g);
+                }
+            }
             Message::Calc(m) => self.calc.update(m),
             Message::SaveDiagnostics => {
                 self.saving_pages = true;
@@ -1485,6 +1629,27 @@ async fn load_pdf(client: Client, source: PdfSource) -> Result<(Arc<pdf::Documen
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// A few new items each get their own notification; more than that become one.
+fn summarise(
+    items: Vec<(String, String, desktop::Target)>,
+    many: impl Fn(usize) -> (String, String, desktop::Target),
+) -> Vec<(String, String, desktop::Target)> {
+    if items.len() > TOASTS_AT_ONCE { vec![many(items.len())] } else { items }
+}
+
+/// Fetches the notifications page and the newest inbox mail without touching
+/// what's on screen.
+fn poll(client: Client, notifications: Url) -> Task<Message> {
+    Task::perform(
+        async move {
+            let notes = page::fetch(&client.0, notifications.as_str()).await.ok().map(|p| views::notification_items(&p));
+            let inbox = mail::list(&client.0, Folder::Inbox, "", 0, 25).await.ok().map(|(items, _)| items);
+            (notes, inbox)
+        },
+        |(notes, inbox)| Message::Polled(notes, inbox),
+    )
 }
 
 fn sign_in(login: String, password: String) -> Task<Message> {

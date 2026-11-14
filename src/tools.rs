@@ -1,6 +1,7 @@
 //! Offline calculators and file downloads.
 
 use crate::Client;
+use guc::academic;
 use guc::mail::{Attachment, OutFile};
 use guc::portal::{self, GradedCourse, number};
 use percent_encoding::percent_decode_str;
@@ -93,6 +94,8 @@ pub enum CalcMsg {
     OutOf(usize, String),
     Add,
     Remove(usize),
+    /// Fill the scores in from a course on the grades page, by its name.
+    Fill(String),
 }
 
 impl Default for GradeCalc {
@@ -121,7 +124,28 @@ impl CalcSummary {
     pub fn standing(&self) -> Option<f32> {
         (self.graded_weight > 0.0).then(|| self.earned / self.graded_weight * 100.0)
     }
+
+    /// Average needed on everything not graded yet (usually the final) to
+    /// finish the course on `target` percent. None when nothing is left.
+    pub fn needed(&self, target: f32) -> Option<f32> {
+        (self.remaining > 0.0).then(|| (target - self.earned) / self.remaining * 100.0)
+    }
 }
+
+/// The lowest course percentage for each letter, on GUC's usual scale.
+pub const LETTER_CUTOFFS: [(&str, f32); 11] = [
+    ("A+", 94.0),
+    ("A", 90.0),
+    ("A-", 86.0),
+    ("B+", 82.0),
+    ("B", 78.0),
+    ("B-", 74.0),
+    ("C+", 70.0),
+    ("C", 65.0),
+    ("C-", 60.0),
+    ("D+", 55.0),
+    ("D", 50.0),
+];
 
 impl GradeCalc {
     pub fn update(&mut self, m: CalcMsg) {
@@ -134,6 +158,36 @@ impl GradeCalc {
             CalcMsg::Remove(i) => {
                 self.parts.remove(i);
             }
+            // Needs the grades, so the workspace handles it with `fill_from`.
+            CalcMsg::Fill(_) => {}
+        }
+    }
+
+    /// Puts a course's published quiz, assignment and midterm results into
+    /// the matching rows, adding rows that are missing. Weights stay as they
+    /// are, since the portal doesn't publish them.
+    pub fn fill_from(&mut self, g: &academic::CourseGrades) {
+        let total = |word: &str| {
+            let marks: Vec<_> = g.quizzes.iter().filter(|q| q.name.to_lowercase().contains(word)).filter_map(|q| Some((q.score?, q.max?))).collect();
+            (!marks.is_empty()).then(|| marks.iter().fold((0.0, 0.0), |(s, m), (a, b)| (s + a, m + b)))
+        };
+        let midterm = g.midterm.as_deref().and_then(|m| number(m.trim_end_matches('%')));
+        let found = [
+            ("quiz", "Quizzes", total("quiz")),
+            ("assign", "Assignments", total("assign")),
+            ("midterm", "Midterm", midterm.map(|m| (m, 100.0))),
+        ];
+        for (word, name, marks) in found {
+            let Some((score, max)) = marks else { continue };
+            let i = match self.parts.iter().position(|p| p.name.to_lowercase().contains(word)) {
+                Some(i) => i,
+                None => {
+                    self.parts.insert(0, Component { name: name.into(), ..Default::default() });
+                    0
+                }
+            };
+            self.parts[i].score = trim_num(score);
+            self.parts[i].out_of = trim_num(max);
         }
     }
 
@@ -416,6 +470,33 @@ mod tests {
         assert!((s.remaining - 60.0).abs() < 1e-4);
         assert!((s.best_possible() - 92.0).abs() < 1e-4);
         assert!((s.standing().unwrap() - 80.0).abs() < 1e-4);
+        // 32 earned with 60 open: a B (78) needs 46 of the 60, about 76.7% on the rest.
+        assert!((s.needed(78.0).unwrap() - 76.666_67).abs() < 1e-3);
+        assert!(s.needed(30.0).unwrap() <= 0.0, "already secured");
+        assert!(s.needed(94.0).unwrap() > 100.0, "out of reach");
+    }
+
+    #[test]
+    fn fills_scores_from_course_grades() {
+        let quiz = |name: &str, score: f32, max: f32| academic::Quiz {
+            name: name.into(),
+            element: String::new(),
+            score: Some(score),
+            max: Some(max),
+            staff: String::new(),
+        };
+        let g = academic::CourseGrades {
+            course: "CSEN 701".into(),
+            quizzes: vec![quiz("Quiz 1", 8.0, 10.0), quiz("Quiz 2", 7.5, 10.0), quiz("Assignment 1", 9.0, 10.0)],
+            midterm: Some("72.5%".into()),
+        };
+        let mut c = GradeCalc::default();
+        c.fill_from(&g);
+        let get = |name: &str| c.parts.iter().find(|p| p.name == name).map(|p| (p.score.clone(), p.out_of.clone())).unwrap();
+        assert_eq!(get("Quizzes"), ("15.5".into(), "20".into()));
+        assert_eq!(get("Assignments"), ("9".into(), "10".into()));
+        assert_eq!(get("Midterm"), ("72.5".into(), "100".into()));
+        assert_eq!(get("Final"), (String::new(), String::new()));
     }
 
     #[test]
