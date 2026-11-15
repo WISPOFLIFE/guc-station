@@ -20,6 +20,8 @@ pub enum Wake {
 pub enum Target {
     Mail(String),
     Notifications,
+    /// A newer version of GUC Station is out.
+    Update,
 }
 
 static SINK: Mutex<Option<mpsc::UnboundedSender<Wake>>> = Mutex::new(None);

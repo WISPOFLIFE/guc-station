@@ -1,6 +1,7 @@
-//! Updating from the GitHub releases of the repository. GitHub is only
-//! contacted when the user asks to check, and only over HTTPS to GitHub's
-//! own hosts.
+//! Updating from the GitHub releases of the repository. GitHub is contacted
+//! when the user asks to check, and about once a day while automatic checks
+//! are on (the default), only over HTTPS to GitHub's own hosts. Installing
+//! always waits for the user to say yes.
 //!
 //! A release needs a version tag (`0.2.0` or `v0.2.0`) and a zip like
 //! `GUC-Station-0.2.0-windows-x64.zip` containing `GUC Station/GUC Station.exe`.

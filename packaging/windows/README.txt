@@ -1,4 +1,4 @@
-GUC Station 0.3.0
+GUC Station 0.4.0
 A desktop app for the GUC student portal, CMS and university mail.
 This is an unofficial app, not made or endorsed by the German University in Cairo.
 
@@ -14,12 +14,25 @@ The app isn't digitally signed, so Windows may show this the first time.
 Click "More info", then "Run anyway". Only do this if you got the zip from
 someone you trust.
 
+RUNNING IN THE BACKGROUND
+- GUC Station starts with Windows and waits in the notification area (by the
+  clock). Closing the window keeps it running there; right-click the tray
+  icon and choose "Quit" to close it fully.
+- While it runs and you are signed in, it checks GUC every 5 minutes and shows
+  a Windows notification for new mail or portal notifications.
+- About once a day it also asks GitHub whether a newer version is out, and
+  shows a notification if one is. Nothing is installed until you say yes.
+- Turn any of these off in Settings: "Start with Windows", "Notify me about
+  new mail and portal notifications" and "Check for updates automatically".
+
 YOUR DATA
 - The app only talks to apps.guc.edu.eg, cms.guc.edu.eg and mail.guc.edu.eg.
-  "Check for updates" in Settings also contacts GitHub, only when you press it.
+  Checking for updates also contacts GitHub: about once a day while automatic
+  checks are on, and whenever you press "Check for updates" in Settings.
 - If you tick "Keep me signed in", your password is saved in Windows Credential
   Manager on this PC. Signing out in Settings removes it.
-- Settings and any pages you save for troubleshooting are in
+- Settings, the list of mail and notifications already announced, and any
+  pages you save for troubleshooting are in
   %LOCALAPPDATA%\GUC Station
 - After you first sign in, the app asks where to put its GUC Station downloads
   folder (Downloads\GUC Station by default). You can change it in Settings.

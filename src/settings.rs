@@ -15,11 +15,13 @@ pub struct Settings {
     pub start_on_boot: bool,
     /// Windows notifications for new mail and portal notifications.
     pub notifications: bool,
+    /// Ask GitHub about once a day whether a newer version is out.
+    pub auto_update_check: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { theme: AppTheme::default(), download_dir: None, start_on_boot: true, notifications: true }
+        Settings { theme: AppTheme::default(), download_dir: None, start_on_boot: true, notifications: true, auto_update_check: true }
     }
 }
 
@@ -34,10 +36,21 @@ pub struct Seen {
     pub notifications_primed: bool,
     pub mail: Vec<String>,
     pub notifications: Vec<String>,
+    /// When GitHub was last asked about updates automatically (Unix seconds).
+    pub update_checked_at: u64,
+    /// The newest version already announced, so each is announced once.
+    pub update_announced: Option<String>,
 }
 
 impl Seen {
     const KEEP: usize = 400;
+    /// Automatic update checks are at least this far apart.
+    pub const UPDATE_EVERY_SECS: u64 = 24 * 60 * 60;
+
+    /// A day has passed since the last automatic check, or the clock went back.
+    pub fn update_check_due(&self, now: u64) -> bool {
+        now < self.update_checked_at || now - self.update_checked_at >= Self::UPDATE_EVERY_SECS
+    }
 
     pub fn load() -> Self {
         std::fs::read_to_string(data_dir().join("seen.json")).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
@@ -68,6 +81,10 @@ pub const FOLDER_NAME: &str = "GUC Station";
 pub fn station_folder(picked: &std::path::Path) -> PathBuf {
     let named = picked.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.eq_ignore_ascii_case(FOLDER_NAME));
     if named { picked.to_path_buf() } else { picked.join(FOLDER_NAME) }
+}
+
+pub fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 pub fn data_dir() -> PathBuf {
@@ -114,6 +131,18 @@ mod tests {
         assert_eq!(station_folder(Path::new("D:/Uni/guc station")), Path::new("D:/Uni/guc station"));
         let old: Settings = serde_json::from_str(r#"{"theme":"Dark"}"#).unwrap();
         assert!(old.download_dir.is_none(), "settings from before this option still load");
-        assert!(old.start_on_boot && old.notifications, "background options default to on");
+        assert!(old.start_on_boot && old.notifications && old.auto_update_check, "background options default to on");
+    }
+
+    #[test]
+    fn update_checks_are_a_day_apart() {
+        let mut seen = Seen::default();
+        assert!(seen.update_check_due(1_000_000), "never checked");
+        seen.update_checked_at = 1_000_000;
+        assert!(!seen.update_check_due(1_000_000 + 60 * 60));
+        assert!(seen.update_check_due(1_000_000 + Seen::UPDATE_EVERY_SECS));
+        assert!(seen.update_check_due(999_000), "clock moved back");
+        let old: Seen = serde_json::from_str(r#"{"mail_primed":true}"#).unwrap();
+        assert!(old.update_announced.is_none() && old.update_check_due(1_000_000), "files from before this still load");
     }
 }

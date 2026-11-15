@@ -1325,12 +1325,16 @@ fn settings<'a>(app: &'a App, ws: &'a Workspace) -> El<'a> {
         ].spacing(10);
     let privacy = column![
             subheading("Privacy"),
-            muted("GUC Station talks only to apps.guc.edu.eg, cms.guc.edu.eg and mail.guc.edu.eg. Your grades, mail and password never pass through any other server. Checking for updates contacts GitHub, and only when you press the button.").size(14),
+            muted("GUC Station talks only to apps.guc.edu.eg, cms.guc.edu.eg and mail.guc.edu.eg. Your grades, mail and password never pass through any other server. Checking for updates contacts GitHub: about once a day while automatic checks are on, and whenever you press the button.").size(14),
         ].spacing(10);
     let updates = column![
             subheading("Updates"),
             text(format!("Version {}", update::CURRENT)).size(14),
             muted("New versions are published on GitHub. Updating downloads the new version, checks it, and restarts the app.").size(13),
+            toggler(app.settings.auto_update_check)
+                .label("Check for updates automatically")
+                .text_size(14)
+                .on_toggle(Message::AutoUpdateToggled),
             row![secondary("Check for updates", Message::CheckForUpdates)],
         ].spacing(10);
     let troubleshooting = column![

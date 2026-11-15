@@ -42,6 +42,10 @@ use url::Url;
 pub const MAIL_PAGE_SIZE: u32 = 40;
 /// How often the app checks for new mail and portal notifications.
 const POLL_EVERY: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+/// How often to see whether a day has passed since the last update check.
+const UPDATE_TICK: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+/// The first automatic update check waits a little after start, out of the way of signing in.
+const FIRST_UPDATE_CHECK: std::time::Duration = std::time::Duration::from_secs(2 * 60);
 /// More new items than this at once become one summary notification.
 const TOASTS_AT_ONCE: usize = 3;
 
@@ -474,6 +478,8 @@ pub struct App {
     pub size: Size,
     /// Mail and notifications already announced in Windows.
     pub seen: settings::Seen,
+    /// A newer version the automatic check found, opened from its notification.
+    pub found_update: Option<update::Release>,
 }
 
 #[derive(Debug, Clone)]
@@ -573,6 +579,10 @@ pub enum Message {
     Desktop(desktop::Wake),
     StartOnBootToggled(bool),
     NotificationsToggled(bool),
+    AutoUpdateToggled(bool),
+    /// Time to see whether an automatic update check is due.
+    AutoCheckUpdates,
+    AutoUpdateChecked(Result<Option<update::Release>, String>),
     /// Time to check for new mail and portal notifications.
     Poll,
     /// (notifications, inbox), each None when it couldn't be fetched.
@@ -599,8 +609,10 @@ impl App {
             picking_folder: false,
             update: None,
             seen: settings::Seen::load(),
+            found_update: None,
         };
-        (app, task)
+        let first_check = Task::perform(tokio::time::sleep(FIRST_UPDATE_CHECK), |_| Message::AutoCheckUpdates);
+        (app, Task::batch([task, first_check]))
     }
 
     /// Brings the window back from the tray, minimised or not.
@@ -666,6 +678,9 @@ impl App {
         if self.settings.notifications && matches!(self.session, Session::SignedIn(_)) {
             subs.push(iced::time::every(POLL_EVERY).map(|_| Message::Poll));
         }
+        if self.settings.auto_update_check {
+            subs.push(iced::time::every(UPDATE_TICK).map(|_| Message::AutoCheckUpdates));
+        }
         Subscription::batch(subs)
     }
 
@@ -699,6 +714,16 @@ impl App {
             }
             Message::Desktop(desktop::Wake::Open(target)) => {
                 let show = Self::show_window();
+                if let desktop::Target::Update = target {
+                    return match self.found_update.clone() {
+                        Some(release) if self.update.is_none() => {
+                            self.update = Some(UpdateDialog::Available(release));
+                            show
+                        }
+                        Some(_) => show,
+                        None => Task::batch([show, self.update(Message::CheckForUpdates)]),
+                    };
+                }
                 let Session::SignedIn(ws) = &mut self.session else { return show };
                 let open = match target {
                     desktop::Target::Notifications => {
@@ -713,6 +738,7 @@ impl App {
                         }
                         Task::batch(tasks)
                     }
+                    desktop::Target::Update => Task::none(),
                 };
                 return Task::batch([show, open]);
             }
@@ -725,6 +751,38 @@ impl App {
             Message::NotificationsToggled(on) => {
                 self.settings.notifications = on;
                 self.settings.save();
+                return Task::none();
+            }
+            Message::AutoUpdateToggled(on) => {
+                self.settings.auto_update_check = on;
+                self.settings.save();
+                return Task::none();
+            }
+            Message::AutoCheckUpdates => {
+                let busy = matches!(self.update, Some(UpdateDialog::Checking | UpdateDialog::Installing(_)));
+                let now = settings::unix_now();
+                if !self.settings.auto_update_check || busy || !self.seen.update_check_due(now) {
+                    return Task::none();
+                }
+                self.seen.update_checked_at = now;
+                self.seen.save();
+                return Task::perform(update::check(), Message::AutoUpdateChecked);
+            }
+            Message::AutoUpdateChecked(r) => {
+                // A failed background check stays quiet; the button in Settings reports errors.
+                if let Ok(Some(release)) = r {
+                    let version = release.version.to_string();
+                    if self.seen.update_announced.as_deref() != Some(version.as_str()) {
+                        self.seen.update_announced = Some(version.clone());
+                        self.seen.save();
+                        desktop::notify(vec![(
+                            format!("GUC Station {version} is available"),
+                            "Click to see what's new and update.".into(),
+                            desktop::Target::Update,
+                        )]);
+                    }
+                    self.found_update = Some(release);
+                }
                 return Task::none();
             }
             Message::Poll => {
